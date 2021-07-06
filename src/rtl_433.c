@@ -133,7 +133,7 @@ static void usage(int exit_code)
             "  [-F kv | json | csv | mqtt | influx | syslog | null | help] Produce decoded output in given format.\n"
             "       Append output to file with :<filename> (e.g. -F csv:log.csv), defaults to stdout.\n"
             "       Specify host/port for syslog with e.g. -F syslog:127.0.0.1:1514\n"
-            "  [-M time[:<options>] | protocol | level | stats | bits | help] Add various meta data to each output.\n"
+            "  [-M time[:<options>] | protocol | level | noise[:secs] | stats | bits | help] Add various meta data to each output.\n"
             "  [-K FILE | PATH | <tag> | <key>=<tag>] Add an expanded token or fixed tag to every output line.\n"
             "  [-C native | si | customary] Convert units in decoded output.\n"
             "  [-T <seconds>] Specify number of seconds to run, also 12:34 or 1h23m45s\n"
@@ -252,7 +252,7 @@ static void help_meta(void)
 {
     term_help_printf(
             "\t\t= Meta information option =\n"
-            "  [-M time[:<options>]|protocol|level|stats|bits] Add various metadata to every output line.\n"
+            "  [-M time[:<options>]|protocol|level|noise[:<secs>]|stats|bits] Add various metadata to every output line.\n"
             "\tUse \"time\" to add current date and time meta data (preset for live inputs).\n"
             "\tUse \"time:rel\" to add sample position meta data (preset for read-file and stdin).\n"
             "\tUse \"time:unix\" to show the seconds since unix epoch as time meta data.\n"
@@ -265,6 +265,7 @@ static void help_meta(void)
             "\t\t\"usec\" and \"utc\" can be combined with other options, eg. \"time:unix:utc:usec\".\n"
             "\tUse \"protocol\" / \"noprotocol\" to output the decoder protocol number meta data.\n"
             "\tUse \"level\" to add Modulation, Frequency, RSSI, SNR, and Noise meta data.\n"
+            "\tUse \"noise[:secs]\" to report estimated noise level at intervals (default: 10 seconds).\n"
             "\tUse \"stats[:[<level>][:<interval>]]\" to report statistics (default: 600 seconds).\n"
             "\t  level 0: no report, 1: report successful devices, 2: report active devices, 3: report all\n"
             "\tUse \"bits\" to add bit representation to code outputs (for debug).\n");
@@ -324,6 +325,8 @@ static void sdr_callback(unsigned char *iq_buf, uint32_t len, void *ctx)
         cfg->exit_async = 1;
     }
 
+    // save last frame time to see if a new second started
+    time_t last_frame_sec = demod->now.tv_sec;
     get_time_now(&demod->now);
 
     n_samples = len / 2 / demod->sample_size;
@@ -348,18 +351,44 @@ static void sdr_callback(unsigned char *iq_buf, uint32_t len, void *ctx)
     }
 
     // AM demodulation
+    float avg_db;
     if (demod->sample_size == 1) { // CU8
         if (demod->use_mag_est) {
             //magnitude_true_cu8(iq_buf, demod->buf.temp, n_samples);
-            magnitude_est_cu8(iq_buf, demod->buf.temp, n_samples);
+            avg_db = magnitude_est_cu8(iq_buf, demod->buf.temp, n_samples);
         }
         else { // amp est
-            envelope_detect(iq_buf, demod->buf.temp, n_samples);
+            avg_db = envelope_detect(iq_buf, demod->buf.temp, n_samples);
         }
     } else { // CS16
         //magnitude_true_cs16((int16_t *)iq_buf, demod->buf.temp, n_samples);
-        magnitude_est_cs16((int16_t *)iq_buf, demod->buf.temp, n_samples);
+        avg_db = magnitude_est_cs16((int16_t *)iq_buf, demod->buf.temp, n_samples);
     }
+    //fprintf(stderr, "noise level: %.1f dB current: %.1f dB min level: %.1f dB\n", demod->noise_level, avg_db, demod->min_level_auto);
+    if (demod->min_level_auto == 0.0f) {
+        demod->min_level_auto = demod->min_level;
+    }
+    if (demod->noise_level == 0.0f) {
+        demod->noise_level = demod->min_level_auto - 3.0f;
+    }
+    int noise_only = avg_db < demod->noise_level + 3.0f; // or demod->min_level_auto?
+    // always process frames if loader, dumper, or analyzers are in use, otherwise skip silent frames
+    int process_frame = !noise_only || demod->load_info.format || demod->analyze_pulses || demod->dumper.len || demod->samp_grab;
+    if (noise_only) {
+        demod->noise_level = (demod->noise_level * 7 + avg_db) / 8; // average over 8 frames
+        if (demod->noise_level < demod->min_level - 3.0f
+                && fabsf(demod->min_level_auto - demod->noise_level - 3.0f) > 1.0f) {
+            demod->min_level_auto = demod->noise_level + 3.0f;
+            fprintf(stderr, "Estimated noise level is %.1f dB, adjusting minimum detection level to %.1f dB\n", demod->noise_level, demod->min_level_auto);
+            pulse_detect_set_levels(demod->pulse_detect, demod->use_mag_est, demod->level_limit, demod->min_level_auto, demod->min_snr, demod->detect_verbosity);
+        }
+    }
+    // Report noise every report_noise seconds, but only for the first frame that second
+    if (cfg->report_noise && last_frame_sec != demod->now.tv_sec && demod->now.tv_sec % cfg->report_noise == 0) {
+        fprintf(stderr, "Current level %.1f dB, estimated noise %.1f dB\n", avg_db, demod->noise_level);
+    }
+
+    if (process_frame)
     baseband_low_pass_filter(demod->buf.temp, demod->am_buf, n_samples, &demod->lowpass_filter_state);
 
     // FM demodulation
@@ -372,7 +401,7 @@ static void sdr_callback(unsigned char *iq_buf, uint32_t len, void *ctx)
             fpdm = FSK_PULSE_DETECT_OLD;
     }
 
-    if (demod->enable_FM_demod) {
+    if (demod->enable_FM_demod && process_frame) {
         float low_pass = demod->low_pass != 0.0f ? demod->low_pass : fpdm ? 0.2f : 0.1f;
         if (demod->sample_size == 1) { // CU8
             baseband_demod_FM(iq_buf, demod->buf.fm, n_samples, cfg->samp_rate, low_pass, &demod->demod_FM_state);
@@ -400,7 +429,7 @@ static void sdr_callback(unsigned char *iq_buf, uint32_t len, void *ctx)
                 break;
             }
         }
-        while (package_type) {
+        while (package_type && process_frame) {
             int p_events = 0; // Sensor events successfully detected per package
             package_type = pulse_detect_package(demod->pulse_detect, demod->am_buf, demod->buf.fm, n_samples, cfg->samp_rate, cfg->input_pos, &demod->pulse_data, &demod->fsk_pulse_data, fpdm);
             if (package_type) {
@@ -959,6 +988,8 @@ static void parse_conf_option(r_cfg_t *cfg, int opt, char *arg)
             cfg->report_protocol = 0;
         else if (!strcasecmp(arg, "level"))
             cfg->report_meta = 1;
+        else if (!strcasecmp(arg, "noise"))
+            cfg->report_noise = atoiv(arg_param(arg), 10); // atoi_time_default()
         else if (!strcasecmp(arg, "bits"))
             cfg->verbose_bits = 1;
         else if (!strcasecmp(arg, "description"))
@@ -971,7 +1002,7 @@ static void parse_conf_option(r_cfg_t *cfg, int opt, char *arg)
             // there also should be options to set wether to flush on report
             char *p = arg_param(arg);
             cfg->report_stats = atoiv(p, 1);
-            cfg->stats_interval = atoiv(arg_param(p), 600);
+            cfg->stats_interval = atoiv(arg_param(p), 600); // atoi_time_default()
             time(&cfg->stats_time);
             cfg->stats_time += cfg->stats_interval;
         }
