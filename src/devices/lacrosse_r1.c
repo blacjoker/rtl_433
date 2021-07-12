@@ -120,7 +120,6 @@ static int lacrosse_r1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
             if (decoder->verbose) {
                 fprintf(stderr, "%s: CRC failed!\n", __func__);
             }
-            else // FIXME: WIP, this exception is for debugging only
             return DECODE_FAIL_MIC;
         }
     }
@@ -137,7 +136,7 @@ static int lacrosse_r1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 
     // base and/or scale adjustments
     // how do we determine rain_mm from raw_rain1 or raw_rain2?
-    //float rain_mm =  0.0;
+    float rain_mm = raw_rain1 * 0.25;
 
     /* clang-format off */
     data_t *data = data_make(
@@ -146,9 +145,9 @@ static int lacrosse_r1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
             "id",               "Sensor ID",        DATA_FORMAT, "%06x", DATA_INT, id,
             "seq",              "Sequence",         DATA_INT,    seq,
             "flags",            "unknown",          DATA_INT,    flags,
-            "rain1",            "raw_rain1",        DATA_INT,    raw_rain1,
+            "rain_mm",          "Total Rain",       DATA_FORMAT, "%.2f mm", DATA_DOUBLE, rain_mm,
             "rain2",            "raw_rain2",        DATA_COND, rev == 3, DATA_INT,    raw_rain2,
-            "mic",              "Integrity",        DATA_COND, !chk, DATA_STRING, "CRC", // FIXME: COND for debugging only
+            "mic",              "Integrity",        DATA_STRING, "CRC",
             NULL);
     /* clang-format on */
 
@@ -161,7 +160,7 @@ static char *output_fields[] = {
         "id",
         "seq",
         "flags",
-        "rain1",
+        "rain_mm",
         "rain2",
         "mic",
         NULL,
